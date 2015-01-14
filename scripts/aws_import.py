@@ -21,11 +21,12 @@ import sys
 import boto.ec2
 import boto.ec2.elb
 import boto.route53
+import boto.s3.connection
 import boto.vpc
 import ConfigParser
 
-RES_TYPES=[
-    'ebs', 'eip', 'elb', 'internet_gateway', 'key_pair',
+RES_TYPES = [
+    'eip', 'elb', 'internet_gateway', 'key_pair',
     'network_acl', 'route_table', 'route53_record', 'route53_zone',
     's3_bucket', 'security_group', 'subnet', 'vpc']
 
@@ -56,14 +57,14 @@ args = arg_parser.parse_args()
 
 class Resource:
     """
-    Class to fetch resources
+    Class to fetch AWS resources and handle Terraform files
     """
 
-    def __init__(self, connection, include_inactive, config_name):
+    def __init__(self, connection, include_inactive):
         self.connection = connection
         self.syslog = logging.getLogger()
         handler = logging.handlers.SysLogHandler(
-            address='/var/run/syslog' if sys.platform=='darwin' else '/dev/log',
+            address='/var/run/syslog' if sys.platform == 'darwin' else '/dev/log',
             facility=logging.handlers.SysLogHandler.LOG_LOCAL1)
         self.syslog.addHandler(handler)
         console = logging.StreamHandler(sys.stdout)
@@ -71,77 +72,183 @@ class Resource:
         self.syslog.addHandler(console)
         self.syslog.setLevel(logging.INFO)
         self.include_inactive = include_inactive
-        self.config_name = config_name
 
     def list_resources(self, resource_type):
         result = {}
-        if resource_type=='eip':
+        if resource_type == 'eip':
             for ip in self.connection['ec2'].get_all_addresses():
                 if ip.instance_id or self.include_inactive:
                     result[ip.public_ip] = None
-        elif resource_type=='ebs':
+        elif resource_type == 'block_device':
+            pass
+            '''
+            # Not implemented, block_devices need to be under instances
+            # and that's only useful if you want Terraform to manage
+            # instances
             for item in self.connection['ec2'].get_all_volumes():
                 if item.status != 'available' or self.include_inactive:
-                    result[item.id] = None
-        elif resource_type=='elb':
-            for elb in sorted(self.connection['elb'].get_all_load_balancers(),
-                              key=lambda v: v.name):
-                result[elb.name] = None
-        elif resource_type=='internet_gateway':
+                    result[item.id] = {
+                        'encrypted': str(item.encrypted),
+                        'size': str(item.size),
+                        'type': item.type
+                    }
+                    if item.iops:
+                        result[item.id]['iops'] = item.iops
+                    if item.snapshot_id:
+                        result[item.id]['snapshot_id'] = item.snapshot_id
+                    if item.tags:
+                        result[item.id] = self.aws_read_tags(result[item.id],
+                                                             item)
+            '''
+        elif resource_type == 'elb':
+            for item in sorted(self.connection['elb'].get_all_load_balancers(),
+                               key=lambda v: v.name):
+                listener = []
+                for iter in item.listeners:
+                    tup1, tup2, tup3 = iter.get_tuple()
+                    listener.append({
+                        'lb_port': tup1,
+                        'instance_port': tup2,
+                        'lb_protocol': tup3,
+                        'instance_protocol': tup3
+                    })
+                result[item.name] = {
+                    'availability_zones': item.availability_zones,
+                    'health_check': {
+                        'healthy_threshold':
+                        str(item.health_check.healthy_threshold),
+                        'interval': str(item.health_check.interval),
+                        'target': item.health_check.target,
+                        'timeout': str(item.health_check.timeout),
+                        'unhealthy_threshold':
+                        str(item.health_check.unhealthy_threshold)
+                    },
+                    'listeners': listener,
+                    'name': item.name
+                }
+                if item.subnets:
+                    result[item.name]['subnets'] = item.subnets
+        elif resource_type == 'internet_gateway':
             for item in self.connection['vpc'].get_all_internet_gateways():
                 result[item.id] = None
-        elif resource_type=='key_pair':
+        elif resource_type == 'key_pair':
             for keypair in sorted(self.connection['ec2'].get_all_key_pairs(),
                                   key=lambda pair: pair.name):
                 result[keypair.name] = {
-                    'fingerprint': keypair.fingerprint
-                    }
-        elif resource_type=='network_acl':
+                    'key_name': keypair.name,
+                    'public_key': 'not_implemented'
+                }
+        elif resource_type == 'network_acl':
             for item in self.connection['vpc'].get_all_network_acls():
+                result[item.id] = {
+                    'vpc_id': item.vpc_id
+                }
+                result[item.id] = self.aws_read_tags(result[item.id], item)
+        elif resource_type == 'route53_record':
+            pass
+            '''
+            # Not implemented, not using Terraform for DNS yet
+            for item in self.connection['route53'].get_all_rrsets():
                 result[item.id] = None
-#        elif resource_type=='route53_record':
-#            for item in self.connection['route53'].get_all_rrsets():
-#                result[item.id] = None
-        elif resource_type=='route53_zone':
+            '''
+        elif resource_type == 'route53_zone':
             api = self.connection['route53'].get_all_hosted_zones()
             for item in api['ListHostedZonesResponse']['HostedZones']:
                 result[item['Id']] = {
                     'name': item['Name']
-                    }
-        elif resource_type=='route_table':
+                }
+        elif resource_type == 'route_table':
             for item in self.connection['vpc'].get_all_route_tables():
-                result[item.id] = None
-        elif resource_type=='s3_bucket':
-            for item in self.connection['vpc'].get_all_route_tables():
-                result[item.id] = None
-        elif resource_type=='subnet':
+                result[item.id] = {
+                    'vpc_id': item.vpc_id
+                }
+                result[item.id] = self.aws_read_tags(result[item.id], item)
+        elif resource_type == 's3_bucket':
+            for item in self.connection['s3'].get_all_buckets():
+                result[item.name] = {
+                    'bucket': item.name
+                }
+        elif resource_type == 'subnet':
             for item in self.connection['vpc'].get_all_subnets():
                 result[item.id] = {
                     'cidr_block': item.cidr_block
-                    }
-        elif resource_type=='security_group':
+                }
+                result[item.id] = self.aws_read_tags(result[item.id], item)
+        elif resource_type == 'security_group':
             for item in self.connection['vpc'].get_all_security_groups():
-                result[item.id] = None
-        elif resource_type=='vpc':
+                result[item.id] = {
+                    'name': item.name,
+                    'description': item.description
+                }
+                result[item.id] = self.aws_read_tags(result[item.id], item)
+        elif resource_type == 'vpc':
             for item in self.connection['vpc'].get_all_vpcs():
                 result[item.id] = {
                     'cidr_block': item.cidr_block
-                    }
-#        else:
-#            raise SyntaxError('Resource type %s not recognized' % resource_type)
+                }
+                result[item.id] = self.aws_read_tags(result[item.id], item)
+        else:
+            raise SyntaxError('Resource type %s not recognized' %
+                              resource_type)
         return result
 
+    # Read AWS tags into a dict with Terraform's syntax, merging into
+    # any existing attributes.  tags.# is set to the number of tags
+    # and the tags attributes are tags.<key>.
+    def aws_read_tags(self, item, obj):
+        result = None
+        if obj.tags:
+            result = {"tags.#": str(len(obj.tags))}
+            for tag, val in obj.tags.items():
+                result["tags.%s" % tag] = val
+        if item and result:
+            return dict(item.items() + result.items())
+        else:
+            return item or result
+
     def tfstate_entry(self, resource_type, resource_key, attrs):
-        desc = { "id": resource_key }
+        desc = {"id": resource_key}
         if attrs:
             desc["attributes"] = attrs
-        return { "aws_%s.%s" % (resource_type, self.config_name):
-                     { "type": "aws_%s" % resource_type,
-                       "primary": desc
-                       }
-               }
+        return {"type": "aws_%s" % resource_type,
+                "primary": desc}
 
-        
+    def tfresource_entry(self, item, name):
+        if "tags" in item and "Name" in item["tags"]:
+            res_name = item["tags"]["Name"].replace(' ', '_')
+        else:
+            res_name = name[name.find('.') + 1:].replace('.', '_')
+        result = "resource \"%s\" \"%s\" {\n" % (item['type'], res_name)
+        if "attributes" in item["primary"]:
+            do_tags = False
+            for key, val in sorted(item["primary"]["attributes"].items()):
+                if key[0:4] == 'tags':
+                    do_tags = True
+                elif key == 'health_check':
+                    result += "    %s {\n" % key
+                    for k, v in val.items():
+                        result += "        %s = \"%s\"\n" % (k, v)
+                    result += "    }\n"
+                elif key == 'listeners':
+                    for iter in val:
+                        result += "    %s {\n" % key[:-1]
+                        for k, v in iter.items():
+                            result += "        %s = \"%s\"\n" % (k, v)
+                        result += "    }\n"
+                elif key == 'subnets' or key == 'availability_zones':
+                    result += "    %s = [\"%s\"]\n" % (key, '", "'.join(val))
+                else:
+                    result += "    %s = \"%s\"\n" % (key, val)
+            if do_tags:
+                result += "    tags {\n"
+                for key, val in sorted(item["primary"]["attributes"].items()):
+                    if key[0:4] == 'tags' and key != 'tags.#':
+                        result += "        \"%s\" = \"%s\"\n" % (key[5:], val)
+                result += "    }\n"
+        result += "}\n"
+        return result
+
+
 def main():
     if args.credentials:
         config_file = "%s/%s" % (os.path.dirname(
@@ -163,30 +270,38 @@ def main():
         aws_secret_access_key=aws_secret_key)
 
     # ELB, Route53, VPC require different connection types
-    if args.resource=='elb' or args.resource==None:
+    if args.resource == 'elb' or args.resource is None:
         awsconn['elb'] = boto.ec2.elb.ELBConnection(
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_key)
-    if args.resource=='route53_record' or args.resource==None:
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key)
+    if args.resource == 'route53_record' or args.resource is None:
         awsconn['route53'] = boto.route53.Route53Connection(
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_key)
-    if args.resource=='vpc' or args.resource==None:
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key)
+    if args.resource == 's3_bucket' or args.resource is None:
+        awsconn['s3'] = boto.s3.connection.S3Connection(
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key)
+    if args.resource == 'vpc' or args.resource is None:
         awsconn['vpc'] = boto.vpc.VPCConnection(
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_key)
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key)
 
-    res = Resource(awsconn, args.inactive, 'infra_%s' % args.aws_region)
+    res = Resource(awsconn, args.inactive)
 
     obj = {
-      "version": 1,
-      "serial": 1,
-      "modules": [ {
-          "resources": {}
-          } ]
+        "version": 1,
+        "serial": 1,
+        "modules": [{
+            "path": [
+                "root"
+            ],
+            "outputs": {},
+            "resources": {}
+        }]
     }
 
-    resources = [ args.resource ] if args.resource else RES_TYPES
+    resources = [args.resource] if args.resource else RES_TYPES
     for resource in resources:
         a = res.list_resources(resource)
 #        for key, item in res.list_resources(resource):
@@ -194,11 +309,20 @@ def main():
 #                    resource, key)] = res.tfstate_entry(resource, key, item)
         for key in a.keys():
             obj["modules"][0]["resources"]["aws_%s.%s" % (
-                    resource, key)] = res.tfstate_entry(resource, key,
-                                                        a[key])
-    fd = os.open(args.state_file, os.O_CREAT|os.O_RDWR|os.O_EXCL)
+                resource, key)] = res.tfstate_entry(resource, key,
+                                                    a[key])
+    fd = os.open(args.state_file, os.O_CREAT | os.O_RDWR | os.O_EXCL)
     with os.fdopen(fd, 'w') as f:
         f.write(json.dumps(obj, sort_keys=True, indent=4))
+    f.close()
+    fd = os.open(args.output_file, os.O_CREAT | os.O_RDWR)
+    with os.fdopen(fd, 'w') as f:
+        f.write("provider \"aws\" {\n    region = \"%s\"\n" % args.aws_region)
+        f.write("}\n\n")
+        for key, item in sorted(obj["modules"][0]["resources"].items()):
+            f.write(res.tfresource_entry(item, key))
+    f.close()
+
 
 if __name__ == '__main__':
     main()
