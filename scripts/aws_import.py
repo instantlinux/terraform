@@ -80,24 +80,13 @@ class Resource:
         self.include_inactive = include_inactive
         self.config_name = config_name
 
-    def list_resources(self, resource_type):
+    # Gather all specified resources from AWS API
+    def gather_resources(self, resource_type):
         result = {}
         if resource_type == 'eip':
             for ip in self.connection['ec2'].get_all_addresses():
                 if ip.instance_id or self.include_inactive:
                     resname = ip.public_ip.replace('.', '_')
-                    '''
-                    result[resname] = {
-                        'attributes': {
-                            'public_ip': ip.public_ip
-                        }
-                    }
-                    if ip.instance_id:
-                        result[resname]["attributes"]["private_ip"] = (
-                            ip.private_ip_address)
-                        result[resname]["attributes"]["instance"] = (
-                            ip.instance_id)
-                    '''
                     result[resname] = {}
                     result[resname]["id"] = ip.public_ip
         elif resource_type == 'block_device':
@@ -117,9 +106,9 @@ class Resource:
                         result[item.id]['iops'] = item.iops
                     if item.snapshot_id:
                         result[item.id]['snapshot_id'] = item.snapshot_id
-                    if item.tags:
-                        result[item.id] = self.aws_read_tags(result[item.id],
-                                                             item)
+                    result[resname]["attributes"] = (
+                        self.aws_read_tags(result[resname]["attributes"], item))
+                    result[resname]["id"] = item.id
             '''
         elif resource_type == 'elb':
             for item in sorted(self.connection['elb'].get_all_load_balancers(),
@@ -208,7 +197,7 @@ class Resource:
                 result[resname]["id"] = keypair.name
         elif resource_type == 'network_acl':
             for item in self.connection['vpc'].get_all_network_acls():
-                resname = item.id
+                resname = self.aws_get_name(item) or item.id
                 result[resname] = {
                     'attributes': {
                         'vpc_id': item.vpc_id
@@ -236,7 +225,7 @@ class Resource:
                 result[resname]["id"] = item['Id']
         elif resource_type == 'route_table':
             for item in self.connection['vpc'].get_all_route_tables():
-                resname = item.id
+                resname = self.aws_get_name(item) or item.id
                 result[resname] = {
                     'attributes': {
                         'vpc_id': item.vpc_id
@@ -256,7 +245,7 @@ class Resource:
                 result[resname]["id"] = item.name
         elif resource_type == 'subnet':
             for item in self.connection['vpc'].get_all_subnets():
-                resname = item.id
+                resname = self.aws_get_name(item) or item.id
                 result[resname] = {
                     'attributes': {
                         'availability_zone': item.availability_zone,
@@ -268,7 +257,8 @@ class Resource:
                 result[resname]["id"] = item.id
         elif resource_type == 'security_group':
             for item in self.connection['vpc'].get_all_security_groups():
-                resname = item.name.replace(' ', '_')
+                resname = (self.aws_get_name(item) or 
+                           item.name.replace(' ', '_'))
                 result[resname] = {
                     'attributes': {
                         'name': item.name,
@@ -280,10 +270,7 @@ class Resource:
                 result[resname]["id"] = item.id
         elif resource_type == 'vpc':
             for item in self.connection['vpc'].get_all_vpcs():
-                if item.tags and 'Name' in item.tags:
-                    resname = item.tags['Name'].replace(' ', '_')
-                else:
-                    resname = item.id
+                resname = self.aws_get_name(item) or item.id
                 result[resname] = {
                     'attributes': {
                         'cidr_block': item.cidr_block,
@@ -298,15 +285,18 @@ class Resource:
                               resource_type)
         return result
 
-    # Read AWS tags into a dict with Terraform's syntax, merging into
-    # any existing attributes.  tags.# is set to the number of tags
-    # and the tags attributes are tags.<key>.
+    # Fetch AWS tag "Name" if it exists
+    def aws_get_name(self, item):
+        if item.tags and 'Name' in item.tags:
+            return item.tags['Name'].replace(' ', '_')
+
+    # Read AWS tags into a dict, merging into any existing attributes.
     def aws_read_tags(self, item, obj):
         result = None
-#        if obj.tags:
-#            result = {"tags.#": str(len(obj.tags))}
-#            for tag, val in obj.tags.items():
-#                result["tags.%s" % tag] = val
+        if obj.tags:
+            result = {"tags": {}}
+            for tag, val in obj.tags.items():
+                result["tags"][tag] = val
         if item and result:
             return dict(item.items() + result.items())
         else:
@@ -326,11 +316,13 @@ class Resource:
             res_name = name[name.find('.') + 1:].replace('.', '_')
         result = "resource \"%s\" \"%s\" {\n" % (item['type'], res_name)
         if "attributes" in item[self.config_name]:
-            do_tags = False
             for key, val in sorted(item[self.config_name]
                                    ["attributes"].items()):
-                if key[0:4] == 'tags':
-                    do_tags = True
+                if key == 'tags':
+                    result += "    %s {\n" % key
+                    for k, v in val.items():
+                        result += "        \"%s\" = \"%s\"\n" % (k, v)
+                    result += "    }\n"
                 elif key == 'health_check':
                     result += "    %s {\n" % key
                     for k, v in val.items():
@@ -346,13 +338,6 @@ class Resource:
                     result += "    %s = [\"%s\"]\n" % (key, '", "'.join(val))
                 else:
                     result += "    %s = \"%s\"\n" % (key, val)
-            if do_tags:
-                result += "    tags {\n"
-                for key, val in sorted(item[self.config_name]
-                                       ["attributes"].items()):
-                    if key[0:4] == 'tags' and key != 'tags.#':
-                        result += "        \"%s\" = \"%s\"\n" % (key[5:], val)
-                result += "    }\n"
         result += "}\n"
         return result
 
@@ -363,8 +348,8 @@ class Resource:
         for key, resource in new["modules"][0]["resources"].items():
             if "attributes" in resource[self.config_name]:
                 for k in resource[self.config_name]["attributes"].keys():
-                    if (k == 'availability_zones' or k == 'subnets' or
-                        k == 'health_check' or k == 'listeners'):
+                    if k in ['availability_zones', 'health_check',
+                             'listeners', 'subnets', 'tags']:
                         del resource[self.config_name]["attributes"][k]
         return new
 
@@ -434,19 +419,19 @@ def main():
 
     resources = [args.resource] if args.resource else RES_TYPES
     for resource in resources:
-        a = res.list_resources(resource)
+        a = res.gather_resources(resource)
         for key in a.keys():
             obj["modules"][0]["resources"]["aws_%s.%s" % (
                 resource, key)] = res.tfstate_entry(resource, a[key])
-    fd = os.open(args.state_file, os.O_CREAT | os.O_RDWR | os.O_EXCL)
+    fd = os.open(args.state_file, os.O_CREAT | os.O_WRONLY | os.O_EXCL)
     with os.fdopen(fd, 'w') as f:
         f.write(json.dumps(res.strip_arrays(obj), sort_keys=True, indent=4))
     f.close()
-    fd = os.open(args.output_file, os.O_CREAT | os.O_RDWR)
+    fd = os.open(args.output_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC )
     with os.fdopen(fd, 'w') as f:
         f.write("provider \"aws\" {\n    region = \"%s\"\n" % args.aws_region)
-        f.write("    access_key = \"%s\"\n" % "{var.access_key}")
-        f.write("    secret_key = \"%s\"\n" % "{var.secret_key}")
+        f.write("    access_key = \"%s\"\n" % "${var.access_key}")
+        f.write("    secret_key = \"%s\"\n" % "${var.secret_key}")
         f.write("#    account = \"%s\"\n" % obj["modules"][0]
                 ["account_info"]["aws_account"])
         f.write("#    name = \"%s\"\n" % obj["modules"][0]
