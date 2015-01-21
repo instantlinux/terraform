@@ -28,10 +28,10 @@ import boto.vpc
 import ConfigParser
 
 RES_TYPES = [
-#    'eip', 'elb', 'iam_group', 'iam_role', 'iam_user', 'internet_gateway',
-    'eip', 'elb', 'internet_gateway',
+    'eip', 'elb', 'iam_group', 'iam_role', 'iam_user', 'internet_gateway',
     'key_pair', 'network_acl', 'route_table', 'route53_record', 'route53_zone',
     's3_bucket', 'security_group', 'subnet', 'vpc']
+UNIMPLEM_TYPES = ['aws_iam_group', 'aws_iam_role', 'aws_iam_user']
 
 arg_parser = argparse.ArgumentParser(description="AWS import utility")
 arg_parser.add_argument('--output-file', '-o',
@@ -41,7 +41,7 @@ arg_parser.add_argument('--state-file', '-f',
                         default='terraform.tfstate',
                         help='State file')
 
-arg_parser.add_argument('--config-name', 
+arg_parser.add_argument('--config-name',
                         default='primary',
                         help='Configuration name')
 arg_parser.add_argument('--resource', choices=RES_TYPES,
@@ -70,7 +70,8 @@ class Resource:
         self.connection = connection
         self.syslog = logging.getLogger()
         handler = logging.handlers.SysLogHandler(
-            address='/var/run/syslog' if sys.platform == 'darwin' else '/dev/log',
+            address=('/var/run/syslog' if sys.platform == 'darwin'
+                     else '/dev/log'),
             facility=logging.handlers.SysLogHandler.LOG_LOCAL1)
         self.syslog.addHandler(handler)
         console = logging.StreamHandler(sys.stdout)
@@ -79,6 +80,8 @@ class Resource:
         self.syslog.setLevel(logging.INFO)
         self.include_inactive = include_inactive
         self.config_name = config_name
+        self.aws_account = (connection['iam'].get_user(
+        )['get_user_response']['get_user_result']['user']['arn'].split(':')[4])
 
     # Gather all specified resources from AWS API
     def gather_resources(self, resource_type):
@@ -107,7 +110,8 @@ class Resource:
                     if item.snapshot_id:
                         result[item.id]['snapshot_id'] = item.snapshot_id
                     result[resname]["attributes"] = (
-                        self.aws_read_tags(result[resname]["attributes"], item))
+                        self.aws_read_tags(result[resname]["attributes"],
+                        item))
                     result[resname]["id"] = item.id
             '''
         elif resource_type == 'elb':
@@ -257,7 +261,7 @@ class Resource:
                 result[resname]["id"] = item.id
         elif resource_type == 'security_group':
             for item in self.connection['vpc'].get_all_security_groups():
-                resname = (self.aws_get_name(item) or 
+                resname = (self.aws_get_name(item) or
                            item.name.replace(' ', '_'))
                 result[resname] = {
                     'attributes': {
@@ -265,6 +269,32 @@ class Resource:
                         'description': item.description
                     }
                 }
+                ingress = []
+                egress = []
+                for rule in item.rules:
+                    ingress.append({
+                        'protocol': ('any' if rule.ip_protocol == "-1"
+                                     else rule.ip_protocol),
+                        'from_port': rule.from_port or 0,
+                        'to_port': rule.to_port or 65535,
+                        'grants': rule.grants
+                    })
+                    if rule.grants[0] == "%s-%s" % (resname, self.aws_account):
+                        ingress[-1]['self'] = 'true'
+                for rule in item.rules_egress:
+                    egress.append({
+                        'protocol': ('any' if rule.ip_protocol == "-1"
+                                     else rule.ip_protocol),
+                        'from_port': rule.from_port or 0,
+                        'to_port': rule.to_port or 65535,
+                        'grants': rule.grants
+                    })
+                    if rule.grants[0] == "%s-%s" % (resname, self.aws_account):
+                        egress[-1]['self'] = 'true'
+                if len(ingress):
+                    result[resname]['attributes']['ingress'] = ingress
+                if len(egress):
+                    result[resname]['attributes']['egress'] = egress
                 result[resname]["attributes"] = (
                     self.aws_read_tags(result[resname]["attributes"], item))
                 result[resname]["id"] = item.id
@@ -314,6 +344,13 @@ class Resource:
             res_name = item["tags"]["Name"].replace(' ', '_')
         else:
             res_name = name[name.find('.') + 1:].replace('.', '_')
+
+        if item['type'] in UNIMPLEM_TYPES:
+            result = "#resource \"%s\" \"%s\" {\n" % (item['type'], res_name)
+            result += "#  (Not yet implemented in Terraform)\n"
+            result += "#}\n"
+            return result
+
         result = "resource \"%s\" \"%s\" {\n" % (item['type'], res_name)
         if "attributes" in item[self.config_name]:
             for key, val in sorted(item[self.config_name]
@@ -328,6 +365,40 @@ class Resource:
                     for k, v in val.items():
                         result += "        %s = \"%s\"\n" % (k, v)
                     result += "    }\n"
+                # Note - as of 1/20/2015, terraform doesn't yet support
+                #   egress rules, commenting those out
+                # elif key in ['egress', 'ingress']:
+                elif key in ['ingress']:
+                    for iter in val:
+                        result += "    %s {\n" % key
+                        for k, v in iter.items():
+                            if k == 'protocol':
+                                v = "\"%s\"" % v
+                            elif k == 'grants':
+                                if str(v[0])[0] in '0123456789':
+                                    k = 'cidr_blocks'
+                                else:
+                                    k = 'security_groups'
+                                v = "[\"%s\"]" % "\",\"".join(map(str, v))
+                            result += "        %s = %s\n" % (k, v)
+                        result += "    }\n"
+
+                # Temporary commenting-out egress
+                elif key in ['egress']:
+                    for iter in val:
+                        result += "#   %s {\n" % key
+                        for k, v in iter.items():
+                            if k == 'protocol':
+                                v = "\"%s\"" % v
+                            elif k == 'grants':
+                                if str(v[0])[0] in '0123456789':
+                                    k = 'cidr_blocks'
+                                else:
+                                    k = 'security_groups'
+                                v = "[\"%s\"]" % "\",\"".join(map(str, v))
+                            result += "#       %s = %s\n" % (k, v)
+                        result += "#   }\n"
+
                 elif key == 'listeners':
                     for iter in val:
                         result += "    %s {\n" % key[:-1]
@@ -342,16 +413,23 @@ class Resource:
         return result
 
     # When generating an initial tfstate file, any nested arrays
-    # have to be stripped out and populated by 'terraform refresh'
+    # have to be stripped out and populated by 'terraform refresh';
+    # also remove unimplemented resource types
     def strip_arrays(self, obj):
         new = copy.deepcopy(obj)
         for key, resource in new["modules"][0]["resources"].items():
-            if "attributes" in resource[self.config_name]:
+            if resource['type'] in UNIMPLEM_TYPES:
+                del new["modules"][0]["resources"][key]
+
+            elif "attributes" in resource[self.config_name]:
                 for k in resource[self.config_name]["attributes"].keys():
-                    if k in ['availability_zones', 'health_check',
-                             'listeners', 'subnets', 'tags']:
+                    if k in ['availability_zones', 'egress', 'health_check',
+                             'ingress', 'listeners', 'subnets', 'tags']:
                         del resource[self.config_name]["attributes"][k]
         return new
+
+    def get_aws_account(self):
+        return self.aws_account
 
 
 def main():
@@ -407,9 +485,7 @@ def main():
             ],
             "outputs": {},
             "account_info": {
-                "aws_account": awsconn['iam'].get_user(
-                )['get_user_response']['get_user_result']['user']
-                ['arn'].split(':')[4],
+                "aws_account": res.get_aws_account(),
                 "aws_name": awsconn['iam'].get_account_alias(
                 ).list_account_aliases_response.list_account_aliases_result.account_aliases[0]
             },
@@ -427,7 +503,7 @@ def main():
     with os.fdopen(fd, 'w') as f:
         f.write(json.dumps(res.strip_arrays(obj), sort_keys=True, indent=4))
     f.close()
-    fd = os.open(args.output_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC )
+    fd = os.open(args.output_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
     with os.fdopen(fd, 'w') as f:
         f.write("provider \"aws\" {\n    region = \"%s\"\n" % args.aws_region)
         f.write("    access_key = \"%s\"\n" % "${var.access_key}")
