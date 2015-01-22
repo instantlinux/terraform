@@ -91,6 +91,10 @@ class Resource:
                 if ip.instance_id or self.include_inactive:
                     resname = ip.public_ip.replace('.', '_')
                     result[resname] = {}
+                    if ip.instance_id:
+                        result[resname]["attributes"] = {
+                            'instance': ip.instance_id
+                        }
                     result[resname]["id"] = ip.public_ip
         elif resource_type == 'block_device':
             pass
@@ -119,13 +123,16 @@ class Resource:
                                key=lambda v: v.name):
                 listener = []
                 for iter in item.listeners:
-                    tup1, tup2, tup3 = iter.get_tuple()
+                    tup1, tup2, tup3, tup4 = iter.get_complex_tuple()
                     listener.append({
                         'lb_port': str(tup1),
                         'instance_port': str(tup2),
-                        'lb_protocol': tup3,
-                        'instance_protocol': tup3
+                        'lb_protocol': tup3.lower(),
+                        'instance_protocol': tup4.lower()
                     })
+                    if iter.ssl_certificate_id:
+                        listener[-1]['ssl_certificate_id'] = (
+                            iter.ssl_certificate_id)
                 resname = item.name
                 result[resname] = {
                     'attributes': {
@@ -186,7 +193,11 @@ class Resource:
         elif resource_type == 'internet_gateway':
             for item in self.connection['vpc'].get_all_internet_gateways():
                 resname = item.id
-                result[resname] = {}
+                result[resname] = {
+                    'attributes': {
+                        'vpc_id': item.attachments[0].vpc_id
+                    }
+                }
                 result[resname]["id"] = item.id
         elif resource_type == 'key_pair':
             for keypair in sorted(self.connection['ec2'].get_all_key_pairs(),
@@ -220,7 +231,7 @@ class Resource:
         elif resource_type == 'route53_zone':
             api = self.connection['route53'].get_all_hosted_zones()
             for item in api['ListHostedZonesResponse']['HostedZones']:
-                resname = item['Name']
+                resname = item['Name'].replace('.', '_')
                 result[resname] = {
                     'attributes': {
                         'name': item['Name']
@@ -232,9 +243,22 @@ class Resource:
                 resname = self.aws_get_name(item) or item.id
                 result[resname] = {
                     'attributes': {
-                        'vpc_id': item.vpc_id
+                        'vpc_id': item.vpc_id,
+                        'routes': []
                     }
                 }
+                for route in item.routes:
+                    if route.gateway_id == 'local':
+                        continue
+                    result[resname]['attributes']['routes'].append({
+                        'cidr_block': route.destination_cidr_block
+                    })
+                    if route.gateway_id:
+                        result[resname]['attributes'][
+                        'routes'][-1]['gateway_id'] = route.gateway_id
+                    if route.instance_id:
+                        result[resname]['attributes'][
+                        'routes'][-1]['instance_id'] = route.instance_id
                 result[resname]["attributes"] = (
                     self.aws_read_tags(result[resname]["attributes"], item))
                 result[resname]["id"] = item.id
@@ -243,7 +267,8 @@ class Resource:
                 resname = item.name
                 result[resname] = {
                     'attributes': {
-                        'bucket': item.name
+                        'bucket': item.name,
+                        'acl': 'private'
                     }
                 }
                 result[resname]["id"] = item.name
@@ -253,7 +278,9 @@ class Resource:
                 result[resname] = {
                     'attributes': {
                         'availability_zone': item.availability_zone,
-                        'cidr_block': item.cidr_block
+                        'cidr_block': item.cidr_block,
+                        'map_public_ip_on_launch': item.mapPublicIpOnLaunch,
+                        'vpc_id': item.vpc_id
                     }
                 }
                 result[resname]["attributes"] = (
@@ -266,21 +293,25 @@ class Resource:
                 result[resname] = {
                     'attributes': {
                         'name': item.name,
-                        'description': item.description
+                        'description': item.description,
+                        'vpc_id': item.vpc_id
                     }
                 }
                 ingress = []
                 egress = []
                 for rule in item.rules:
                     ingress.append({
-                        'protocol': ('any' if rule.ip_protocol == "-1"
-                                     else rule.ip_protocol),
+                        'protocol': rule.ip_protocol,
                         'from_port': rule.from_port or 0,
-                        'to_port': rule.to_port or 65535,
+                        'to_port': rule.to_port or 0,
                         'grants': rule.grants
                     })
-                    if rule.grants[0] == "%s-%s" % (resname, self.aws_account):
+                    if (rule.grants[0] == "%s-%s" % (resname, self.aws_account)
+                        or
+                        str(rule.grants[0]) == "%s-%s" % (item.id,
+                                                          self.aws_account)):
                         ingress[-1]['self'] = 'true'
+                        del rule.grants[0]
                 for rule in item.rules_egress:
                     egress.append({
                         'protocol': ('any' if rule.ip_protocol == "-1"
@@ -289,8 +320,12 @@ class Resource:
                         'to_port': rule.to_port or 65535,
                         'grants': rule.grants
                     })
-                    if rule.grants[0] == "%s-%s" % (resname, self.aws_account):
+                    if (rule.grants[0] == "%s-%s" % (resname, self.aws_account)
+                        or
+                        str(rule.grants[0]) == "%s-%s" % (item.id,
+                                                          self.aws_account)):
                         egress[-1]['self'] = 'true'
+                        del rule.grants[0]
                 if len(ingress):
                     result[resname]['attributes']['ingress'] = ingress
                 if len(egress):
@@ -358,7 +393,8 @@ class Resource:
                 if key == 'tags':
                     result += "    %s {\n" % key
                     for k, v in val.items():
-                        result += "        \"%s\" = \"%s\"\n" % (k, v)
+                        result += "        \"%s\" = \"%s\"\n" % (
+                            k, v.replace('"', '\\"'))
                     result += "    }\n"
                 elif key == 'health_check':
                     result += "    %s {\n" % key
@@ -375,6 +411,8 @@ class Resource:
                             if k == 'protocol':
                                 v = "\"%s\"" % v
                             elif k == 'grants':
+                                if len(v) == 0:
+                                    continue
                                 if str(v[0])[0] in '0123456789':
                                     k = 'cidr_blocks'
                                 else:
@@ -391,6 +429,8 @@ class Resource:
                             if k == 'protocol':
                                 v = "\"%s\"" % v
                             elif k == 'grants':
+                                if len(v) == 0:
+                                    continue
                                 if str(v[0])[0] in '0123456789':
                                     k = 'cidr_blocks'
                                 else:
@@ -399,7 +439,7 @@ class Resource:
                             result += "#       %s = %s\n" % (k, v)
                         result += "#   }\n"
 
-                elif key == 'listeners':
+                elif key in ['listeners', 'routes']:
                     for iter in val:
                         result += "    %s {\n" % key[:-1]
                         for k, v in iter.items():
@@ -424,7 +464,8 @@ class Resource:
             elif "attributes" in resource[self.config_name]:
                 for k in resource[self.config_name]["attributes"].keys():
                     if k in ['availability_zones', 'egress', 'health_check',
-                             'ingress', 'listeners', 'subnets', 'tags']:
+                             'ingress', 'listeners', 'routes', 'subnets',
+                             'tags']:
                         del resource[self.config_name]["attributes"][k]
         return new
 
