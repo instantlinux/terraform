@@ -31,7 +31,7 @@ RES_TYPES = [
     'eip', 'elb', 'iam_group', 'iam_role', 'iam_user', 'internet_gateway',
     'key_pair', 'network_acl', 'route_table', 'route53_record', 'route53_zone',
     's3_bucket', 'security_group', 'subnet', 'vpc']
-UNIMPLEM_TYPES = ['aws_iam_group', 'aws_iam_role', 'aws_iam_user']
+UNIMPLEM_TYPES = ['iam_group', 'iam_role', 'iam_user']
 
 arg_parser = argparse.ArgumentParser(description="AWS import utility")
 arg_parser.add_argument('--output-file', '-o',
@@ -40,12 +40,15 @@ arg_parser.add_argument('--output-file', '-o',
 arg_parser.add_argument('--state-file', '-f',
                         default='terraform.tfstate',
                         help='State file')
-
 arg_parser.add_argument('--config-name',
                         default='primary',
                         help='Configuration name')
 arg_parser.add_argument('--resource', choices=RES_TYPES,
-                        help='AWS resource type')
+                        action='append', help='AWS resource type')
+arg_parser.add_argument('--exclude', choices=RES_TYPES,
+                        action='append', help='AWS resource types to exclude')
+arg_parser.add_argument('--ignore-auth-errors', action='store_true',
+                        help='Ignore unauthorized resource types')
 arg_parser.add_argument('--inactive', action='store_true',
                         help='Include stopped/terminated instances')
 arg_parser.add_argument('--credentials', '-c',
@@ -56,9 +59,12 @@ arg_parser.add_argument('--aws-access-key-id', '-a',
 arg_parser.add_argument('--aws-secret-access-key', '-s',
                         default=os.environ['AWS_SECRET_ACCESS_KEY'],
                         help='AWS secret')
+arg_parser.add_argument('--aws-account',
+                        help='AWS account')
 arg_parser.add_argument('--aws-region', default='us-east-1',
                         help='AWS region')
-args = arg_parser.parse_args()
+if __name__ == '__main__':
+    args = arg_parser.parse_args()
 
 
 class Resource:
@@ -66,7 +72,12 @@ class Resource:
     Class to fetch AWS resources and handle Terraform files
     """
 
-    def __init__(self, connection, include_inactive, config_name):
+    def __init__(self, connection,
+                 ignore_auth_errors=False,
+                 include_inactive=False,
+                 config_name='primary'):
+        """Constructor for Terraform resource connection to AWS"""
+
         self.connection = connection
         self.syslog = logging.getLogger()
         handler = logging.handlers.SysLogHandler(
@@ -78,23 +89,36 @@ class Resource:
         console.setLevel(logging.DEBUG)
         self.syslog.addHandler(console)
         self.syslog.setLevel(logging.INFO)
+        self.ignore_auth_errors = ignore_auth_errors
         self.include_inactive = include_inactive
         self.config_name = config_name
-        self.aws_account = (connection['iam'].get_user(
-        )['get_user_response']['get_user_result']['user']['arn'].split(':')[4])
+        try:
+            self.aws_account = (connection['iam'].get_user(
+            )['get_user_response']['get_user_result'][
+                'user']['arn'].split(':')[4])
+        except boto.exception.BotoServerError:
+            self.aws_account = None
 
-    # Gather all specified resources from AWS API
     def gather_resources(self, resource_type):
+        """Gather all specified resources from AWS API"""
+
         result = {}
         if resource_type == 'eip':
             for ip in self.connection['ec2'].get_all_addresses():
                 if ip.instance_id or self.include_inactive:
-                    resname = ip.public_ip.replace('.', '_')
-                    result[resname] = {}
                     if ip.instance_id:
-                        result[resname]["attributes"] = {
-                            'instance': ip.instance_id
+                        inst = self.connection['ec2'].get_only_instances(
+                            [ip.instance_id])
+                        resname = (inst[0].tags['Name'] or
+                                   ip.public_ip.replace('.', '_'))
+                        result[resname] = {
+                            'attributes': {
+                                'instance': ip.instance_id
+                            }
                         }
+                    else:
+                        resname = ip.public_ip.replace('.', '_')
+                        result[resname] = {}
                     result[resname]["id"] = ip.public_ip
         elif resource_type == 'block_device':
             pass
@@ -136,7 +160,6 @@ class Resource:
                 resname = item.name
                 result[resname] = {
                     'attributes': {
-                        'availability_zones': item.availability_zones,
                         'health_check': {
                             'healthy_threshold': str(
                                 item.health_check.healthy_threshold),
@@ -152,10 +175,19 @@ class Resource:
                 }
                 if item.subnets:
                     result[resname]["attributes"]["subnets"] = item.subnets
+                else:
+                    result[resname]["attributes"]["availability_zones"] = (
+                        item.availability_zones)
                 result[resname]["id"] = item.name
         elif resource_type == 'iam_group':
-            for item in self.connection['iam'].get_all_groups(
-            ).list_groups_response.list_groups_result.groups:
+            try:
+                groups = self.connection['iam'].get_all_groups(
+                ).list_groups_response.list_groups_result.groups
+            except boto.exception.BotoServerError:
+                groups = []
+                if not self.ignore_auth_errors:
+                    raise boto.exception.BotoServerError
+            for item in groups:
                 resname = item.group_name
                 result[resname] = {
                     'attributes': {
@@ -166,8 +198,14 @@ class Resource:
                 }
                 result[resname]["id"] = item.group_id
         elif resource_type == 'iam_role':
-            for item in self.connection['iam'].list_roles(
-            ).list_roles_response.list_roles_result.roles:
+            try:
+                roles = self.connection['iam'].list_roles(
+                ).list_roles_response.list_roles_result.roles
+            except boto.exception.BotoServerError:
+                roles = []
+                if not self.ignore_auth_errors:
+                    raise boto.exception.BotoServerError
+            for item in roles:
                 resname = item.role_name
                 result[resname] = {
                     'attributes': {
@@ -179,8 +217,14 @@ class Resource:
                 }
                 result[resname]["id"] = item.role_id
         elif resource_type == 'iam_user':
-            for item in self.connection['iam'].get_all_users(
-            ).list_users_response.list_users_result.users:
+            try:
+                users = self.connection['iam'].get_all_users(
+                ).list_users_response.list_users_result.users
+            except boto.exception.BotoServerError:
+                users = []
+                if not self.ignore_auth_errors:
+                    raise boto.exception.BotoServerError
+            for item in users:
                 resname = item.user_name
                 result[resname] = {
                     'attributes': {
@@ -192,12 +236,15 @@ class Resource:
                 result[resname]["id"] = item.user_id
         elif resource_type == 'internet_gateway':
             for item in self.connection['vpc'].get_all_internet_gateways():
-                resname = item.id
-                result[resname] = {
-                    'attributes': {
-                        'vpc_id': item.attachments[0].vpc_id
+                resname = self.aws_get_name(item) or item.id
+                if item.attachments:
+                    result[resname] = {
+                        'attributes': {
+                            'vpc_id': item.attachments[0].vpc_id
+                        }
                     }
-                }
+                else:
+                    result[resname] = {}
                 result[resname]["id"] = item.id
         elif resource_type == 'key_pair':
             for keypair in sorted(self.connection['ec2'].get_all_key_pairs(),
@@ -206,7 +253,7 @@ class Resource:
                 result[resname] = {
                     'attributes': {
                         'key_name': keypair.name,
-                        'public_key': 'not_implemented'
+                        'public_key': 'please-insert-manually'
                     }
                 }
                 result[resname]["id"] = keypair.name
@@ -255,10 +302,10 @@ class Resource:
                     })
                     if route.gateway_id:
                         result[resname]['attributes'][
-                        'routes'][-1]['gateway_id'] = route.gateway_id
+                            'routes'][-1]['gateway_id'] = route.gateway_id
                     if route.instance_id:
                         result[resname]['attributes'][
-                        'routes'][-1]['instance_id'] = route.instance_id
+                            'routes'][-1]['instance_id'] = route.instance_id
                 result[resname]["attributes"] = (
                     self.aws_read_tags(result[resname]["attributes"], item))
                 result[resname]["id"] = item.id
@@ -290,6 +337,8 @@ class Resource:
             for item in self.connection['vpc'].get_all_security_groups():
                 resname = (self.aws_get_name(item) or
                            item.name.replace(' ', '_'))
+                if resname == 'default':
+                    continue
                 result[resname] = {
                     'attributes': {
                         'name': item.name,
@@ -314,8 +363,7 @@ class Resource:
                         del rule.grants[0]
                 for rule in item.rules_egress:
                     egress.append({
-                        'protocol': ('any' if rule.ip_protocol == "-1"
-                                     else rule.ip_protocol),
+                        'protocol': rule.ip_protocol,
                         'from_port': rule.from_port or 0,
                         'to_port': rule.to_port or 65535,
                         'grants': rule.grants
@@ -350,17 +398,19 @@ class Resource:
                               resource_type)
         return result
 
-    # Fetch AWS tag "Name" if it exists
     def aws_get_name(self, item):
+        """Fetch AWS tag "Name" if it exists"""
         if item.tags and 'Name' in item.tags:
             return item.tags['Name'].replace(' ', '_')
 
-    # Read AWS tags into a dict, merging into any existing attributes.
     def aws_read_tags(self, item, obj):
+        """Read AWS tags into a dict, merging into any existing attributes."""
         result = None
         if obj.tags:
             result = {"tags": {}}
             for tag, val in obj.tags.items():
+                if tag[:4] == 'aws:':
+                    tag = tag.replace('aws:', 'aws-', 1)
                 result["tags"][tag] = val
         if item and result:
             return dict(item.items() + result.items())
@@ -380,7 +430,7 @@ class Resource:
         else:
             res_name = name[name.find('.') + 1:].replace('.', '_')
 
-        if item['type'] in UNIMPLEM_TYPES:
+        if item['type'][4:] in UNIMPLEM_TYPES:
             result = "#resource \"%s\" \"%s\" {\n" % (item['type'], res_name)
             result += "#  (Not yet implemented in Terraform)\n"
             result += "#}\n"
@@ -452,13 +502,26 @@ class Resource:
         result += "}\n"
         return result
 
-    # When generating an initial tfstate file, any nested arrays
-    # have to be stripped out and populated by 'terraform refresh';
-    # also remove unimplemented resource types
+    def tfvariables(self, vars):
+        """Generate variable definitions"""
+        result = ""
+        for varname, content in vars.items():
+            result += "variable \"%s\" {\n" % varname
+            result += "    default = {\n"
+            for key, val in content.items():
+                result += "        %s = \"%s\"\n" % (key, val)
+            result += "    }\n}\n"
+        return result
+
     def strip_arrays(self, obj):
+        """
+        When generating an initial tfstate file, any nested arrays
+        have to be stripped out and populated by 'terraform refresh';
+        also remove unimplemented resource types
+        """
         new = copy.deepcopy(obj)
         for key, resource in new["modules"][0]["resources"].items():
-            if resource['type'] in UNIMPLEM_TYPES:
+            if resource['type'][4:] in UNIMPLEM_TYPES:
                 del new["modules"][0]["resources"][key]
 
             elif "attributes" in resource[self.config_name]:
@@ -469,8 +532,61 @@ class Resource:
                         del resource[self.config_name]["attributes"][k]
         return new
 
+    def update_dependencies(self, obj, resource_map, vars):
+        """
+        Look up AWS ID-specific items, and update them into Terraform
+         resource-name dependencies
+        """
+        for key, resource in obj["modules"][0]["resources"].items():
+            res_type = resource['type'][4:]
+            if res_type in ['internet_gateway', 'network_acl', 'route_table',
+                            'security_group', 'subnet']:
+                try:
+                    resource[self.config_name]['attributes']['vpc_id'] = (
+                        "${%s}" % resource_map["vpc.%s" % resource[
+                            self.config_name]['attributes']['vpc_id']])
+                except KeyError:
+                    pass
+            if res_type == 'route_table':
+                for route in resource[self.config_name][
+                        'attributes']['routes']:
+                    try:
+                        route['gateway_id'] = (
+                            "${%s}" % resource_map["internet_gateway.%s" %
+                                                   route['gateway_id']])
+                    except KeyError:
+                        pass
+            if res_type == 'elb':
+                for k, subnet in enumerate(
+                        resource[self.config_name]['attributes']['subnets']):
+                    resource[self.config_name]['attributes']['subnets'][k] = (
+                        "${%s}" % resource_map["subnet.%s" % subnet])
+                if vars.has_key('ssl_cert_arn'):
+                    for listener in resource[self.config_name]['attributes']['listeners']:
+                        print vars['ssl_cert_arn']['prefix']
+                        try:
+                            listener['ssl_certificate_id'] = (
+                                listener['ssl_certificate_id'].replace(vars['ssl_cert_arn']['prefix'], "${var.ssl_cert_arn.prefix}"))
+                            print "replaced %s" % listener['ssl_certificate_id']
+                        except KeyError:
+                            pass
+            if res_type == 'subnet':
+                try:
+                    resource[self.config_name]['attributes']['availability_zone'] = (
+                        "${var.zones.%s}" % vars['zones'].keys()[list(vars['zones'].values()).index(resource[self.config_name]['attributes']['availability_zone'])])
+                except KeyError:
+                    pass
+
     def get_aws_account(self):
         return self.aws_account
+
+    def get_aws_name(self):
+        try:
+            return self.connection['iam'].get_account_alias(
+            ).list_account_aliases_response.list_account_aliases_result.\
+                account_aliases[0]
+        except (KeyError, boto.exception.BotoServerError):
+            return None
 
 
 def main():
@@ -493,30 +609,43 @@ def main():
         aws_access_key_id=aws_access_key,
         aws_secret_access_key=aws_secret_key)
 
+    resource_list = args.resource or RES_TYPES
+    if args.exclude:
+        for item in args.exclude:
+            resource_list.remove(item)
+
+    awsconn['iam'] = boto.iam.connection.IAMConnection(
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key)
+
     # ELB, Route53, VPC require different connection types
-    if args.resource == 'elb' or args.resource is None:
+    if 'elb' in resource_list:
         awsconn['elb'] = boto.ec2.elb.ELBConnection(
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key)
-    if args.resource == 'iam_role' or args.resource is None:
-        awsconn['iam'] = boto.iam.connection.IAMConnection(
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key)
-    if args.resource == 'route53_record' or args.resource is None:
+    if 'route53_record' in resource_list:
         awsconn['route53'] = boto.route53.Route53Connection(
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key)
-    if args.resource == 's3_bucket' or args.resource is None:
+    if 's3_bucket' in resource_list:
         awsconn['s3'] = boto.s3.connection.S3Connection(
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key)
-    if args.resource == 'vpc' or args.resource is None:
+    if 'vpc' in resource_list:
         awsconn['vpc'] = boto.vpc.VPCConnection(
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key)
 
-    res = Resource(awsconn, args.inactive, args.config_name)
+    res = Resource(awsconn, args.ignore_auth_errors, args.inactive,
+                   args.config_name)
 
+    # Build two data structures:
+    #  'obj' is the main tree of AWS resources
+    #  'resource_map' is a mapping from resource ID to Terraform
+    #    names, for dependency mapping (see
+    #    https://www.terraform.io/intro/getting-started/dependencies.html)
+    aws_account = args.aws_account or res.get_aws_account()
+    aws_name = res.get_aws_name()
     obj = {
         "version": 1,
         "serial": 1,
@@ -526,34 +655,58 @@ def main():
             ],
             "outputs": {},
             "account_info": {
-                "aws_account": res.get_aws_account(),
-                "aws_name": awsconn['iam'].get_account_alias(
-                ).list_account_aliases_response.list_account_aliases_result.account_aliases[0]
+                "aws_account": aws_account,
+                "aws_name": aws_name
             },
             "resources": {}
         }]
     }
+    resource_map = {}
 
-    resources = [args.resource] if args.resource else RES_TYPES
-    for resource in resources:
+    for resource in resource_list:
         a = res.gather_resources(resource)
         for key in a.keys():
             obj["modules"][0]["resources"]["aws_%s.%s" % (
                 resource, key)] = res.tfstate_entry(resource, a[key])
+            resource_map["%s.%s" % (resource, a[key]['id'])] = (
+                "aws_%s.%s.id" % (resource, key))
+
+    # Generate the terraform.tfstate file from obj
     fd = os.open(args.state_file, os.O_CREAT | os.O_WRONLY | os.O_EXCL)
     with os.fdopen(fd, 'w') as f:
         f.write(json.dumps(res.strip_arrays(obj), sort_keys=True, indent=4))
     f.close()
+
+    # Update dependencies
+    variables = {
+        'zones': {
+            'zone0': args.aws_region + "a",
+            'zone1': args.aws_region + "b",
+            'zone2': args.aws_region + "c",
+            'zone3': args.aws_region + "d",
+            'zone4': args.aws_region + "e"
+        }
+    }
+    if aws_account:
+        variables['ssl_cert_arn'] = {
+            'prefix': "arn:aws:iam::%s:server-certificate" % aws_account
+        }
+    res.update_dependencies(obj, resource_map, variables)
+
+    # Generate the resource definitions file
     fd = os.open(args.output_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
     with os.fdopen(fd, 'w') as f:
         f.write("provider \"aws\" {\n    region = \"%s\"\n" % args.aws_region)
         f.write("    access_key = \"%s\"\n" % "${var.access_key}")
         f.write("    secret_key = \"%s\"\n" % "${var.secret_key}")
-        f.write("#    account = \"%s\"\n" % obj["modules"][0]
-                ["account_info"]["aws_account"])
-        f.write("#    name = \"%s\"\n" % obj["modules"][0]
-                ["account_info"]["aws_name"])
+        if aws_account:
+            f.write("#    account = \"%s\"\n" % aws_account)
+        if aws_name:
+            f.write("#    name = \"%s\"\n" % aws_name)
         f.write("}\n\n")
+
+        f.write(res.tfvariables(variables))
+
         for key, item in sorted(obj["modules"][0]["resources"].items()):
             f.write(res.tfresource_entry(item, key))
     f.close()
