@@ -92,6 +92,7 @@ class Resource:
         self.ignore_auth_errors = ignore_auth_errors
         self.include_inactive = include_inactive
         self.config_name = config_name
+        self.resource_map = {}
         try:
             self.aws_account = (connection['iam'].get_user(
             )['get_user_response']['get_user_result'][
@@ -352,28 +353,54 @@ class Resource:
                     ingress.append({
                         'protocol': rule.ip_protocol,
                         'from_port': rule.from_port or 0,
-                        'to_port': rule.to_port or 0,
-                        'grants': rule.grants
+                        'to_port': rule.to_port or 0
                     })
-                    if (rule.grants[0] == "%s-%s" % (resname, self.aws_account)
-                        or
-                        str(rule.grants[0]) == "%s-%s" % (item.id,
-                                                          self.aws_account)):
-                        ingress[-1]['self'] = 'true'
-                        del rule.grants[0]
+                    grps = []
+                    cidrs = []
+                    for grant in rule.grants:
+                        if (grant == "%s-%s" % (resname, self.aws_account)
+                                or grant.group_id == item.id):
+                            ingress[-1]['self'] = 'true'
+                        elif grant.cidr_ip:
+                            cidrs.append(grant.cidr_ip)
+                        else:
+                            grps.append(grant.group_id)
+                    if grps:
+                        ingress[-1]['security_groups'] = grps
+                    if cidrs:
+                        if grps:
+                            ingress.append({
+                                'protocol': rule.ip_protocol,
+                                'from_port': rule.from_port or 0,
+                                'to_port': rule.to_port or 0
+                            })
+                        ingress[-1]['cidr_blocks'] = cidrs
                 for rule in item.rules_egress:
                     egress.append({
                         'protocol': rule.ip_protocol,
                         'from_port': rule.from_port or 0,
-                        'to_port': rule.to_port or 65535,
-                        'grants': rule.grants
+                        'to_port': rule.to_port or 0
                     })
-                    if (rule.grants[0] == "%s-%s" % (resname, self.aws_account)
-                        or
-                        str(rule.grants[0]) == "%s-%s" % (item.id,
-                                                          self.aws_account)):
-                        egress[-1]['self'] = 'true'
-                        del rule.grants[0]
+                    grps = []
+                    cidrs = []
+                    for grant in rule.grants:
+                        if (grant == "%s-%s" % (resname, self.aws_account)
+                                or grant.group_id == item.id):
+                            egress[-1]['self'] = 'true'
+                        elif grant.cidr_ip:
+                            cidrs.append(grant.cidr_ip)
+                        else:
+                            grps.append(grant.group_id)
+                    if grps:
+                        egress[-1]['security_groups'] = grps
+                    if cidrs:
+                        if grps:
+                            egress.append({
+                                'protocol': rule.ip_protocol,
+                                'from_port': rule.from_port or 0,
+                                'to_port': rule.to_port or 0
+                            })
+                        egress[-1]['cidr_blocks'] = cidrs
                 if len(ingress):
                     result[resname]['attributes']['ingress'] = ingress
                 if len(egress):
@@ -417,10 +444,12 @@ class Resource:
         else:
             return item or result
 
-    def tfstate_entry(self, resource_type, definition):
+    def tfstate_entry(self, resource_type, definition, name):
         desc = {"id": definition["id"]}
         if "attributes" in definition:
             desc["attributes"] = definition["attributes"]
+        self.resource_map["%s.%s" % (resource_type, definition['id'])] = (
+            "aws_%s.%s.id" % (resource_type, name))
         return {"type": "aws_%s" % resource_type,
                 self.config_name: desc}
 
@@ -460,14 +489,18 @@ class Resource:
                         for k, v in iter.items():
                             if k == 'protocol':
                                 v = "\"%s\"" % v
+                            elif k in ['security_groups', 'cidr_blocks']:
+                                v = "[\"%s\"]" % "\",\"".join(map(str, v))
+                            '''
                             elif k == 'grants':
                                 if len(v) == 0:
                                     continue
-                                if str(v[0])[0] in '0123456789':
+                                if v[0].cidr_ip:
                                     k = 'cidr_blocks'
                                 else:
                                     k = 'security_groups'
                                 v = "[\"%s\"]" % "\",\"".join(map(str, v))
+                            '''
                             result += "        %s = %s\n" % (k, v)
                         result += "    }\n"
 
@@ -536,7 +569,7 @@ class Resource:
                         del resource[self.config_name]["attributes"][k]
         return new
 
-    def update_dependencies(self, obj, resource_map, vars):
+    def update_dependencies(self, obj, vars):
         """
         Look up AWS ID-specific items, and update them into Terraform
         resource-name dependencies
@@ -547,7 +580,7 @@ class Resource:
                             'security_group', 'subnet']:
                 try:
                     resource[self.config_name]['attributes']['vpc_id'] = (
-                        "${%s}" % resource_map["vpc.%s" % resource[
+                        "${%s}" % self.resource_map["vpc.%s" % resource[
                             self.config_name]['attributes']['vpc_id']])
                 except KeyError:
                     pass
@@ -556,7 +589,7 @@ class Resource:
                         'attributes']['routes']:
                     try:
                         route['gateway_id'] = (
-                            "${%s}" % resource_map["internet_gateway.%s" %
+                            "${%s}" % self.resource_map["internet_gateway.%s" %
                                                    route['gateway_id']])
                     except KeyError:
                         pass
@@ -564,7 +597,7 @@ class Resource:
                 for k, subnet in enumerate(
                         resource[self.config_name]['attributes']['subnets']):
                     resource[self.config_name]['attributes']['subnets'][k] = (
-                        "${%s}" % resource_map["subnet.%s" % subnet])
+                        "${%s}" % self.resource_map["subnet.%s" % subnet])
                 if 'ssl_cert_arn' in vars:
                     for listener in resource[self.config_name][
                             'attributes']['listeners']:
@@ -573,6 +606,23 @@ class Resource:
                                 listener['ssl_certificate_id'].replace(
                                     vars['ssl_cert_arn']['prefix'],
                                     "${var.ssl_cert_arn.prefix}"))
+                        except KeyError:
+                            pass
+            if res_type == 'security_group':
+                entries = []
+                if 'ingress' in resource[self.config_name]['attributes']:
+                    entries += resource[self.config_name]['attributes'][
+                        'ingress']
+                if 'egress' in resource[self.config_name]['attributes']:
+                    entries += resource[self.config_name]['attributes'][
+                        'egress']
+                for perm in entries:
+                    if 'security_groups' not in perm:
+                        continue
+                    for k, grp in enumerate(perm['security_groups']):
+                        try:
+                            perm['security_groups'][k] = ("${%s}" %
+                                self.resource_map["security_group.%s" % grp])
                         except KeyError:
                             pass
             if res_type == 'subnet':
@@ -588,6 +638,9 @@ class Resource:
 
     def get_aws_account(self):
         return self.aws_account
+
+    def set_aws_account(self, account):
+        self.aws_account = account
 
     def get_aws_name(self):
         try:
@@ -654,6 +707,7 @@ def main():
     #    names, for dependency mapping (see
     #    https://www.terraform.io/intro/getting-started/dependencies.html)
     aws_account = args.aws_account or res.get_aws_account()
+    res.set_aws_account(aws_account)
     aws_name = res.get_aws_name()
     obj = {
         "version": 1,
@@ -670,15 +724,12 @@ def main():
             "resources": {}
         }]
     }
-    resource_map = {}
 
     for resource in resource_list:
         a = res.gather_resources(resource)
         for key in a.keys():
             obj["modules"][0]["resources"]["aws_%s.%s" % (
-                resource, key)] = res.tfstate_entry(resource, a[key])
-            resource_map["%s.%s" % (resource, a[key]['id'])] = (
-                "aws_%s.%s.id" % (resource, key))
+                resource, key)] = res.tfstate_entry(resource, a[key], key)
 
     # Generate the terraform.tfstate file from obj
     fd = os.open(args.state_file, os.O_CREAT | os.O_WRONLY | os.O_EXCL)
@@ -702,7 +753,7 @@ def main():
         variables['ssl_cert_arn'] = {
             'prefix': "arn:aws:iam::%s:server-certificate" % aws_account
         }
-    res.update_dependencies(obj, resource_map, variables)
+    res.update_dependencies(obj, variables)
 
     # Generate the resource definitions file
     fd = os.open(args.output_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
