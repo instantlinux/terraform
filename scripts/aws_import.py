@@ -505,12 +505,16 @@ class Resource:
     def tfvariables(self, vars):
         """Generate variable definitions"""
         result = ""
-        for varname, content in vars.items():
-            result += "variable \"%s\" {\n" % varname
-            result += "    default = {\n"
-            for key, val in content.items():
-                result += "        %s = \"%s\"\n" % (key, val)
-            result += "    }\n}\n"
+        for varname, content in sorted(vars.items()):
+            if content:
+                result += "variable \"%s\" {\n" % varname
+                result += "    default = {\n"
+                for key, val in content.items():
+                    result += "        %s = \"%s\"\n" % (key, val)
+                result += "    }\n}\n"
+            else:
+                result += "variable \"%s\" {}\n" % varname
+        result += "\n"
         return result
 
     def strip_arrays(self, obj):
@@ -535,7 +539,7 @@ class Resource:
     def update_dependencies(self, obj, resource_map, vars):
         """
         Look up AWS ID-specific items, and update them into Terraform
-         resource-name dependencies
+        resource-name dependencies
         """
         for key, resource in obj["modules"][0]["resources"].items():
             res_type = resource['type'][4:]
@@ -561,19 +565,24 @@ class Resource:
                         resource[self.config_name]['attributes']['subnets']):
                     resource[self.config_name]['attributes']['subnets'][k] = (
                         "${%s}" % resource_map["subnet.%s" % subnet])
-                if vars.has_key('ssl_cert_arn'):
-                    for listener in resource[self.config_name]['attributes']['listeners']:
-                        print vars['ssl_cert_arn']['prefix']
+                if 'ssl_cert_arn' in vars:
+                    for listener in resource[self.config_name][
+                            'attributes']['listeners']:
                         try:
                             listener['ssl_certificate_id'] = (
-                                listener['ssl_certificate_id'].replace(vars['ssl_cert_arn']['prefix'], "${var.ssl_cert_arn.prefix}"))
-                            print "replaced %s" % listener['ssl_certificate_id']
+                                listener['ssl_certificate_id'].replace(
+                                    vars['ssl_cert_arn']['prefix'],
+                                    "${var.ssl_cert_arn.prefix}"))
                         except KeyError:
                             pass
             if res_type == 'subnet':
                 try:
-                    resource[self.config_name]['attributes']['availability_zone'] = (
-                        "${var.zones.%s}" % vars['zones'].keys()[list(vars['zones'].values()).index(resource[self.config_name]['attributes']['availability_zone'])])
+                    resource[self.config_name]['attributes'][
+                        'availability_zone'] = (
+                            "${var.zones.%s}" % vars['zones'].keys()[
+                            list(vars['zones'].values()).index(
+                            resource[self.config_name]['attributes'][
+                            'availability_zone'])])
                 except KeyError:
                     pass
 
@@ -679,6 +688,8 @@ def main():
 
     # Update dependencies
     variables = {
+        'access_key': {},
+        'secret_key': {},
         'zones': {
             'zone0': args.aws_region + "a",
             'zone1': args.aws_region + "b",
@@ -696,6 +707,9 @@ def main():
     # Generate the resource definitions file
     fd = os.open(args.output_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
     with os.fdopen(fd, 'w') as f:
+
+        f.write(res.tfvariables(variables))
+
         f.write("provider \"aws\" {\n    region = \"%s\"\n" % args.aws_region)
         f.write("    access_key = \"%s\"\n" % "${var.access_key}")
         f.write("    secret_key = \"%s\"\n" % "${var.secret_key}")
@@ -704,8 +718,6 @@ def main():
         if aws_name:
             f.write("#    name = \"%s\"\n" % aws_name)
         f.write("}\n\n")
-
-        f.write(res.tfvariables(variables))
 
         for key, item in sorted(obj["modules"][0]["resources"].items()):
             f.write(res.tfresource_entry(item, key))
